@@ -1,0 +1,7 @@
+simple_mailchimp.settings:
+  path: '/admin/config/simple-mailchimp/config'
+  defaults:
+    _form: '\Drupal\simple_mailchimp\Form\SubscriptionConfigForm'
+    _title: 'Simple MailChimp Configuration'
+  requirements:
+    _permission: 'access simple mailchimp settings'

@@ -1,0 +1,342 @@
+<?php
+
+/**
+ * @file
+ * Contains simple_mailchimp.module..
+ */
+
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Component\Utility\UrlHelper;
+use Drupal\simple_mailchimp\Utilities\ValidateDate;
+use Drupal\simple_mailchimp\Utilities\ValidateZipCode;
+
+/**
+ * Implements hook_help().
+ */
+function simple_mailchimp_help($route_name, RouteMatchInterface $route_match) {
+
+  switch ($route_name) {
+    case 'help.page.simple_mailchimp':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('Provides MailChimp API integration with site forms. Configurable to attach subscription fields to any existing form. Also creates a single, stand alone subscription form.') . '</p>';
+      return $output;
+
+    default:
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function simple_mailchimp_theme() {
+
+  return [
+    'test_twig' => [
+      'variables' => ['output' => NULL],
+    ],
+  ];
+}
+
+/**
+ * Get MailChimp group data.
+ *
+ * @return mixed
+ *   Returns an associative array of interests with interest id as key.
+ */
+function simple_mailchimp_get_mailchimp_group_data() {
+
+  $mailchimp = \Drupal::service('simple_mailchimp.mailchimpApi');
+
+  // Get interest-category title.
+  $group_title = $mailchimp->request('group_title');
+
+  // Get interest-category options.
+  $group_data = $mailchimp->request('group_data');
+
+  $interest_category_title = $group_title['title'];
+  $interest_group[$interest_category_title] = $group_data['interests'];
+
+  return $interest_group;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Adding a subscription checkbox to enabled forms.
+ * Forms are managed via admin configuration form @ simple_mailchimp.config.
+ */
+function simple_mailchimp_form_alter(&$form, &$form_state, $form_id) {
+
+  // Load module config.
+  $config = \Drupal::config('simple_mailchimp.settings');
+
+  // Clean settings into multi-dimensional array.
+  $return_settings = simple_mailchimp_configuration_cleaner();
+  if (!empty($return_settings)) {
+
+    // Get form ids by calling array_keys on $return_settings.
+    $form_ids = array_keys($return_settings);
+
+    // Convert form id array into single line for matchPath().
+    $form_ids_single_line = implode("\n", $form_ids);
+
+    // Trying to ensure submit button is last.
+    $form['submit']['#weight'] = 1000;
+
+    // Check if this form is a match, if so add subscribe and interest fields.
+    if (\Drupal::service('path.matcher')->matchPath($form_id, $form_ids_single_line)) {
+      $form['field_subscribe'] = [
+        '#type' => 'checkbox',
+        '#title' => $config->get('text'),
+        '#required' => FALSE,
+        '#prefix' => '',
+        '#suffix' => '',
+        '#weigth' => 998,
+        '#default_value' => 1,
+      ];
+
+      // Check for interest group id.
+      $interest_group_id = $config->get('interestGroup');
+      if ($interest_group_id) {
+        // Get all options for this interest group id.
+        $subscription_interests = simple_mailchimp_get_mailchimp_group_data();
+
+        // Get the title of this interest group.
+        $label = current(array_keys($subscription_interests));
+
+        // Get the options with id as value and title as label.
+        $options = '';
+        foreach ($subscription_interests[$label] as $value) {
+          $options[$value['id']] = $value['name'];
+        }
+
+        // Add interest field to form.
+        $form['subscription_interests'] = [
+          '#type' => 'checkboxes',
+          '#title' => $label,
+          '#options' => $options,
+          '#weigth' => 999,
+        ];
+      }
+
+      // Add custom validation and submit handlers.
+      $form['#validate'][] = '_simple_mailchimp_form_validate_global_handler';
+
+      // "Contact forms" and regular forms have submit handlers in different
+      // locations. I'm not sure why, but that's why we're checking here.
+      if (isset($form['actions']['submit']['#submit'])) {
+        array_unshift($form['actions']['submit']['#submit'], '_simple_mailchimp_form_submit_global_handler');
+      }
+      else {
+        array_unshift($form['#submit'], '_simple_mailchimp_form_submit_global_handler');
+      }
+    }
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _simple_mailchimp_form_validate_global_handler(array &$form, FormStateInterface $form_state) {
+
+  // Get current form id.
+  $form_id = $form['#form_id'];
+
+  // Load module config.
+  $config = \Drupal::config('simple_mailchimp.settings');
+
+  // Check for formIds configuration setting.
+  $form_ids = $config->get('formIds');
+
+  if ($form_ids) {
+
+    // Clean settings into multi-dimensional array.
+    $form_variables = simple_mailchimp_configuration_cleaner();
+
+    // Get email address based on form id.
+    $email_var = $form_variables[$form_id]['email_id'];
+    $email = $form_state->getValue($email_var);
+
+    if (!\Drupal::service('email.validator')->isValid($email)) {
+      $form_state->setErrorByName($email, t('Please enter a valid email address.'));
+    }
+  }
+}
+
+/**
+ * {@inheritdoc}
+ */
+function _simple_mailchimp_form_submit_global_handler(&$form, &$form_state) {
+
+  $form_id = $form['#form_id'];
+
+  if ($form_state->getValue('field_subscribe')) {
+    // Load module config.
+    $config = \Drupal::config('simple_mailchimp.settings');
+
+    // Check for form configuration setting.
+    $form_ids = $config->get('formIds');
+
+    if ($form_ids) {
+
+      // Clean settings into multi-dimensional array.
+      $form_variables = simple_mailchimp_configuration_cleaner();
+
+      // Get email address based on form id.
+      $email_var = $form_variables[$form_id]['email_id'];
+      $email = $form_state->getValue($email_var);
+
+      // Get the user language. Selected language on the website.
+      $language = Drupal::languageManager()->getCurrentLanguage()->getId();
+      $language = (($language == 'pt-pt') ? 'pt_PT' : $language);
+
+      // Get merge fields from settings and clean.
+      $merge_fields = '';
+      if (!empty($form_variables[$form_id]['merge_fields'])) {
+        $merge_vars_single_line = $form_variables[$form_id]['merge_fields'];
+        $merge_vars_explode = explode(',', $merge_vars_single_line);
+
+        // Loop through each merge field listed in settings.
+        $merge_fields = NULL;
+        foreach ($merge_vars_explode as $key => $value) {
+          $merge_fields_explode = explode(':', $value);
+
+          $field_name = $merge_fields_explode[2];
+          $field_value = $form_state->getValue($field_name);
+          $field_type = $merge_fields_explode[1];
+          $field_final = '';
+
+          // Mailchimp has various field types which are noted in our settings
+          // we do our best to generically accommodate as many field types as
+          // we can phone is notoriously difficult and will only be accepted in
+          // 555-555-5555 format we do not advise using a native form field on
+          // MailChimp.
+          switch ($field_type) {
+            case 'text':
+              $field_final = $field_value;
+              break;
+
+            case 'zip_code':
+              $validator = new ValidateZipCode();
+              $field_final = $validator->validate($field_value);
+              break;
+
+            case 'number':
+              if (ctype_digit($field_value)) {
+                $field_final = $field_value;
+              }
+              break;
+
+            case 'address':
+              $form_address_parts = explode('--', $field_name);
+              $address = [];
+
+              foreach ($form_address_parts as $key => $value) {
+                $parts = explode('-', $value);
+                $field_key = $parts[0];
+                $field_id = $parts[1];
+                $field_value = $form_state->getValue($field_id);
+
+                $address[$field_key] = $field_value;
+              }
+              $field_final = $address;
+              break;
+
+            case 'date':
+              try {
+                $dt = new DateTime(trim($field_value));
+                $date = $dt->format('m/d');
+                $field_final = $date;
+              }
+              catch (Exception $e) {
+                $field_final = '';
+              }
+              break;
+
+            case 'phone':
+              if (preg_match('/^([0-9]{3})[-]?([0-9]{3})[-]?([0-9]{4})/', $field_value)) {
+                $field_final = $field_value;
+              }
+              else {
+                $field_final = '';
+              }
+              break;
+
+            case 'birthday':
+              $validator = new ValidateDate();
+              $field_final = $validator->validate($field_value);
+              break;
+
+            case 'website':
+              if (UrlHelper::isValid($field_value, TRUE)) {
+                $field_final = $field_value;
+              }
+              break;
+
+          }
+
+          // If that merge field has a value, add it to the merge_vars array.
+          if ($field_final) {
+            $merge_fields[$merge_fields_explode[0]] = $field_final;
+          }
+        }
+      }
+
+      // Check if an interest group id exists, and if so, loop through them.
+      $interests = NULL;
+      if ($config->get('interestGroup')) {
+        $subscription_interests = $form_state->getValue('subscription_interests');
+        foreach ($subscription_interests as $key => $value) {
+          if ($value) {
+            $interests[$key] = TRUE;
+          }
+          else {
+            $interests[$key] = FALSE;
+          }
+        }
+      }
+
+      // Send to api subscribe function.
+      $mailchimp = \Drupal::service('simple_mailchimp.mailchimpApi');
+      $mailchimp->subscribe($email, $merge_fields, $interests, $language);
+    }
+  }
+}
+
+/**
+ * This function is used to split the configuration setting into usable parts.
+ *
+ * Example setting to be split: contact_form|email:mail|FNAME:fname,LNAME:lname.
+ *
+ * @return array
+ *   Returns a clean array of configuration settings.
+ */
+function simple_mailchimp_configuration_cleaner() {
+
+  $result = [];
+
+  $config = \Drupal::config('simple_mailchimp.settings');
+  $config_forms = $config->get('formIds');
+
+  if ($config_forms) {
+    foreach ($config_forms as $value) {
+      $split_value = explode('|', $value);
+      $form_id = $split_value[0];
+      if (count($split_value) > 1) {
+        $email_id = substr($split_value[1], strpos($split_value[1], ":") + 1);
+
+        $result[$form_id]['email_id'] = $email_id;
+        if (!empty($split_value[2])) {
+          $result[$form_id]['merge_fields'] = $split_value[2];
+        }
+      }
+      else {
+        $result[$form_id]['email_id'] = 'email';
+      }
+    }
+  }
+
+  return $result;
+}
